@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8fafc; /* slate-50 */
+  --foreground: #0f172a; /* slate-900 */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #f8fafc; /* Keep light mode forced for now */
+    --foreground: #0f172a;
+  }
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: Arial, Helvetica, sans-serif;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
