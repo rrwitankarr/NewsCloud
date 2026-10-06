@@ -1,66 +1,222 @@
 import json
 import asyncio
+
 from services.search import search_web_for_claim
 from services.scraper import scrape_url
-from services.embedding import chunk_text, retrieve_top_k_chunks, rerank_chunks
+from services.embedding import (
+    chunk_text,
+    retrieve_top_k_chunks,
+    rerank_chunks
+)
 from services.llm import generate_verdict
+
 
 async def run_verification_pipeline_sse(claim: str):
     """
-    Executes the full AVeriTeC pipeline and yields SSE JSON events for progress.
+    Executes the full AVeriTeC pipeline and yields SSE JSON events
+    for progress.
+
+    The final result contains:
+        - verdict
+        - explanation
+        - evidence
+        - urls
+        - verification status
+        - AI availability
     """
-    yield json.dumps({"status": "processing", "message": f"Starting pipeline for claim: '{claim}'"})
+
+    # =========================================================
+    # START
+    # =========================================================
+
+    yield json.dumps({
+        "status": "processing",
+        "message": f"Starting pipeline for claim: '{claim}'"
+    })
+
     await asyncio.sleep(0.1)
-    
-    # 1. Search
-    yield json.dumps({"status": "processing", "message": "Searching the web..."})
-    search_results = search_web_for_claim(claim, max_results=5)
-    urls = search_results["urls"]
-    snippets = search_results["snippets"]
-    
+
+    # =========================================================
+    # 1. SEARCH
+    # =========================================================
+
+    yield json.dumps({
+        "status": "processing",
+        "message": "Searching the web..."
+    })
+
+    search_results = search_web_for_claim(
+        claim,
+        max_results=5
+    )
+
+    urls = search_results.get("urls", [])
+    snippets = search_results.get("snippets", [])
+
     if not urls:
-        yield json.dumps({"status": "error", "message": "Failed to find any relevant search results to verify this claim."})
+        yield json.dumps({
+            "status": "error",
+            "message": (
+                "Failed to find any relevant search results "
+                "to verify this claim."
+            )
+        })
         return
-    yield json.dumps({"status": "processing", "message": f"Found {len(urls)} URLs. Scraping content..."})
+
+    yield json.dumps({
+        "status": "processing",
+        "message": (
+            f"Found {len(urls)} URLs. "
+            "Scraping content..."
+        )
+    })
+
     await asyncio.sleep(0.1)
-    
-    # 2. Scrape & Chunk
+
+    # =========================================================
+    # 2. SCRAPE & CHUNK
+    # =========================================================
+
     all_chunks = []
+
     for url in urls:
-        text = scrape_url(url)
-        if text:
-            chunks = chunk_text(text)
-            all_chunks.extend(chunks)
-            
-    yield json.dumps({"status": "processing", "message": f"Generated {len(all_chunks)} chunks of evidence."})
+
+        try:
+            text = scrape_url(url)
+
+            if text:
+                chunks = chunk_text(text)
+                all_chunks.extend(chunks)
+
+        except Exception as e:
+            print(
+                f"Failed to scrape {url}: {e}"
+            )
+
+    yield json.dumps({
+        "status": "processing",
+        "message": (
+            f"Generated {len(all_chunks)} "
+            "chunks of evidence."
+        )
+    })
+
     await asyncio.sleep(0.1)
-    
+
+    # =========================================================
+    # 3. RETRIEVE TOP 50
+    # =========================================================
+
     top_5_chunks = []
+
     if all_chunks:
-        # 3. Retrieve Top 50 (Bi-Encoder)
-        yield json.dumps({"status": "processing", "message": "Retrieving top chunks (Bi-Encoder)..."})
-        top_50_chunks = retrieve_top_k_chunks(claim, all_chunks, top_k=50)
+
+        yield json.dumps({
+            "status": "processing",
+            "message": (
+                "Retrieving top chunks "
+                "(Bi-Encoder)..."
+            )
+        })
+
+        try:
+
+            top_50_chunks = retrieve_top_k_chunks(
+                claim,
+                all_chunks,
+                top_k=50
+            )
+
+        except Exception as e:
+
+            print(
+                f"Bi-Encoder retrieval failed: {e}"
+            )
+
+            top_50_chunks = []
+
         await asyncio.sleep(0.1)
-        
-        # 4. Re-rank Top 5 (Cross-Encoder)
-        yield json.dumps({"status": "processing", "message": "Re-ranking top chunks (Cross-Encoder)..."})
-        top_5_chunks = rerank_chunks(claim, top_50_chunks, top_k=5)
-        await asyncio.sleep(0.1)
-    
-    # Combine search snippets (which often contain the direct answer) with the deep-dive semantic chunks
-    final_evidence = [f"Search Result Summary: {s}" for s in snippets] + top_5_chunks
-    
+
+        # =====================================================
+        # 4. RE-RANK TOP 5
+        # =====================================================
+
+        if top_50_chunks:
+
+            yield json.dumps({
+                "status": "processing",
+                "message": (
+                    "Re-ranking top chunks "
+                    "(Cross-Encoder)..."
+                )
+            })
+
+            try:
+
+                top_5_chunks = rerank_chunks(
+                    claim,
+                    top_50_chunks,
+                    top_k=5
+                )
+
+            except Exception as e:
+
+                print(
+                    f"Cross-Encoder re-ranking failed: {e}"
+                )
+
+                top_5_chunks = []
+
+            await asyncio.sleep(0.1)
+
+    # =========================================================
+    # 5. BUILD FINAL EVIDENCE
+    # =========================================================
+
+    # Search snippets are useful because they often contain
+    # the direct answer to the claim.
+    search_evidence = [
+        f"Search Result Summary: {snippet}"
+        for snippet in snippets
+        if snippet
+    ]
+
+    # Deep semantic evidence obtained through:
+    #
+    # Bi-Encoder -> Top 50
+    # Cross-Encoder -> Top 5
+    #
+    deep_evidence = [
+        chunk
+        for chunk in top_5_chunks
+        if chunk
+    ]
+
+    final_evidence = (
+        search_evidence +
+        deep_evidence
+    )
+
     if not final_evidence:
-        yield json.dumps({"status": "error", "message": "Failed to gather any evidence."})
+
+        yield json.dumps({
+            "status": "error",
+            "message": "Failed to gather any evidence."
+        })
+
         return
-        
-        # 5. Generate Verdict (LLM)
+
+    # =========================================================
+    # 6. GENERATE VERDICT
+    # =========================================================
+
     yield json.dumps({
         "status": "processing",
         "message": "Generating verdict with Gemini..."
     })
 
     try:
+
         result = generate_verdict(
             claim,
             final_evidence
@@ -68,9 +224,9 @@ async def run_verification_pipeline_sse(claim: str):
 
     except Exception as e:
 
-        # Defensive fallback in case an unexpected error
-        # escapes the LLM service.
-        print(f"Unexpected LLM pipeline error: {e}")
+        print(
+            f"Unexpected LLM pipeline error: {e}"
+        )
 
         result = {
             "verdict": None,
@@ -84,24 +240,48 @@ async def run_verification_pipeline_sse(claim: str):
             "degradation_reason": "unexpected_llm_error",
         }
 
-    # Attach evidence regardless of AI availability
+    # =========================================================
+    # 7. ATTACH EVIDENCE AND URLS
+    # =========================================================
+
+    # IMPORTANT:
+    #
+    # These two fields are what claims.py will save into
+    # PostgreSQL.
+    #
+    # The next user will receive these from the database
+    # instead of performing another web search.
+
     result["evidence"] = final_evidence
+
     result["urls"] = urls
 
-    # Overall pipeline completed
+    # =========================================================
+    # 8. MARK PIPELINE COMPLETE
+    # =========================================================
+
     result["status"] = "complete"
 
-    # Tell frontend how verification was performed
+    # =========================================================
+    # 9. VERIFICATION MESSAGE
+    # =========================================================
+
     if result.get("verification_status") == "degraded":
+
         result["message"] = (
             "Verification completed in degraded mode. "
             "Supporting evidence was collected, but AI "
             "verification is temporarily unavailable."
         )
+
     else:
+
         result["message"] = (
             "Verification completed successfully."
         )
 
+    # =========================================================
+    # 10. SEND FINAL RESULT
+    # =========================================================
+
     yield json.dumps(result)
-    

@@ -14,19 +14,23 @@ from services.embedding import get_bi_encoder
 from pipeline import run_verification_pipeline_sse
 
 
-router = APIRouter(prefix="/api/claims", tags=["claims"])
+router = APIRouter(
+    prefix="/api/claims",
+    tags=["claims"]
+)
 
-# ---------------------------------------------------------
+
+# =========================================================
 # CACHE CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
 
 # Cached verification results are valid for 7 days.
 CACHE_DURATION = timedelta(days=7)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HELPER: CHECK WHETHER A CACHED RESULT IS DEGRADED
-# ---------------------------------------------------------
+# =========================================================
 
 def is_degraded_cached_result(cached_claim) -> bool:
     """
@@ -36,7 +40,9 @@ def is_degraded_cached_result(cached_claim) -> bool:
     Degraded results should never be reused from the cache.
     """
 
-    explanation = (cached_claim.explanation or "").lower()
+    explanation = (
+        cached_claim.explanation or ""
+    ).lower()
 
     degraded_markers = [
         "503",
@@ -57,21 +63,23 @@ def is_degraded_cached_result(cached_claim) -> bool:
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # VERIFY CLAIM - SSE ENDPOINT
-# ---------------------------------------------------------
+# =========================================================
 
 @router.post("/verify/stream")
 async def verify_claim_stream(
     request: Request,
     claim: schemas.ClaimRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    current_user: models.User = Depends(
+        auth.get_current_user
+    ),
 ):
 
-    # -----------------------------------------------------
+    # =====================================================
     # 1. GENERATE CLAIM EMBEDDING
-    # -----------------------------------------------------
+    # =====================================================
 
     bi_encoder = get_bi_encoder()
 
@@ -80,24 +88,31 @@ async def verify_claim_stream(
         convert_to_tensor=True
     )
 
-    embedding_list = embedding_tensor.cpu().numpy().tolist()
+    embedding_list = (
+        embedding_tensor
+        .cpu()
+        .numpy()
+        .tolist()
+    )
 
-
-    # -----------------------------------------------------
+    # =====================================================
     # 2. SEARCH DATABASE FOR SIMILAR CLAIM
-    # -----------------------------------------------------
+    # =====================================================
 
-    similar_record = db.query(
-        models.Claim,
-        models.Claim.embedding.cosine_distance(
-            embedding_list
-        ).label("distance")
-    ).order_by("distance").first()
+    similar_record = (
+        db.query(
+            models.Claim,
+            models.Claim.embedding.cosine_distance(
+                embedding_list
+            ).label("distance")
+        )
+        .order_by("distance")
+        .first()
+    )
 
-
-    # -----------------------------------------------------
+    # =====================================================
     # 3. SSE EVENT GENERATOR
-    # -----------------------------------------------------
+    # =====================================================
 
     async def event_generator():
 
@@ -105,7 +120,10 @@ async def verify_claim_stream(
         # FAST PATH - DATABASE CACHE
         # =================================================
 
-        if similar_record and similar_record.distance < 0.05:
+        if (
+            similar_record
+            and similar_record.distance < 0.05
+        ):
 
             cached_claim = similar_record.Claim
 
@@ -124,11 +142,17 @@ async def verify_claim_stream(
             if created_at is not None:
 
                 # Handle timezone-aware timestamps safely.
-                now = datetime.now(
-                    created_at.tzinfo
-                ) if created_at.tzinfo else datetime.utcnow()
+                now = (
+                    datetime.now(
+                        created_at.tzinfo
+                    )
+                    if created_at.tzinfo
+                    else datetime.utcnow()
+                )
 
-                cache_age = now - created_at
+                cache_age = (
+                    now - created_at
+                )
 
                 if cache_age > CACHE_DURATION:
 
@@ -143,21 +167,22 @@ async def verify_claim_stream(
                     db.delete(cached_claim)
                     db.commit()
 
-
             # -------------------------------------------------
-            # 3B. CHECK WHETHER CACHE IS A DEGRADED RESULT
+            # 3B. CHECK WHETHER CACHE IS DEGRADED
             # -------------------------------------------------
 
             cached_result_is_degraded = False
 
             # Only inspect the record if it hasn't already
             # been deleted because of expiration.
+
             if cache_is_fresh:
 
                 cached_result_is_degraded = (
-                    is_degraded_cached_result(cached_claim)
+                    is_degraded_cached_result(
+                        cached_claim
+                    )
                 )
-
 
             # -------------------------------------------------
             # 3C. DELETE OLD DEGRADED CACHE RECORD
@@ -175,7 +200,6 @@ async def verify_claim_stream(
 
                 # Continue to live verification below.
 
-
             # -------------------------------------------------
             # 3D. REUSE VALID CACHE
             # -------------------------------------------------
@@ -183,48 +207,134 @@ async def verify_claim_stream(
             elif cache_is_fresh:
 
                 print(
-                    "Using valid cached verification result."
+                    "Using valid cached verification result "
+                    "including cached evidence."
                 )
+
+                # =================================================
+                # LOAD SUPPORTING EVIDENCE FROM DATABASE
+                # =================================================
+
+                cached_evidence_rows = (
+                    db.query(models.Evidence)
+                    .filter(
+                        models.Evidence.claim_id
+                        == cached_claim.id
+                    )
+                    .order_by(
+                        models.Evidence.id
+                    )
+                    .all()
+                )
+
+                # Convert database Evidence objects back into
+                # the same format used by the live pipeline.
+                cached_evidence = []
+
+                for evidence_row in cached_evidence_rows:
+
+                    if evidence_row.chunk_text:
+
+                        cached_evidence.append(
+                            evidence_row.chunk_text
+                        )
+
+                # =================================================
+                # LOAD CACHED SOURCE URLS
+                # =================================================
+
+                cached_urls = []
+
+                for evidence_row in cached_evidence_rows:
+
+                    if (
+                        evidence_row.source_url
+                        and evidence_row.source_url
+                        not in cached_urls
+                    ):
+
+                        cached_urls.append(
+                            evidence_row.source_url
+                        )
+
+                # =================================================
+                # CACHE PROGRESS MESSAGE
+                # =================================================
 
                 yield {
                     "data": json.dumps({
                         "status": "processing",
                         "message": (
                             "Fast Path: Found recent "
-                            "verified claim in database!"
+                            "verified claim in database. "
+                            "Loading cached evidence..."
                         )
                     })
                 }
 
+                # =================================================
+                # RETURN COMPLETE CACHED RESULT
+                # =================================================
+
                 yield {
                     "data": json.dumps({
+
+                        # Database claim ID
                         "claim_id": cached_claim.id,
+
+                        # Cached verdict
                         "verdict": cached_claim.verdict,
-                        "explanation": cached_claim.explanation,
-                        "evidence": [],
-                        "urls": ["Cached from Database"],
+
+                        # Cached explanation
+                        "explanation": (
+                            cached_claim.explanation
+                        ),
+
+                        # IMPORTANT:
+                        # Supporting evidence now comes
+                        # from PostgreSQL.
+                        "evidence": cached_evidence,
+
+                        # IMPORTANT:
+                        # Original source URLs also come
+                        # from PostgreSQL.
+                        "urls": cached_urls,
+
+                        # Pipeline status
                         "status": "complete",
+
+                        # This result came from cache.
+                        "cached": True,
 
                         # Cached results are previous successful
                         # verification results.
                         "verification_status": "normal",
-                        "ai_available": True
+
+                        "ai_available": True,
+
+                        # Useful for frontend display/debugging.
+                        "message": (
+                            "This claim was previously verified. "
+                            "The verdict and supporting evidence "
+                            "were retrieved from the database."
+                        )
                     })
                 }
 
                 return
 
-
-        # =================================================
+        # =========================================================
         # SLOW PATH - LIVE VERIFICATION
-        # =================================================
+        # =========================================================
 
         print(
             "Running live verification pipeline..."
         )
 
-        async for progress_json in run_verification_pipeline_sse(
-            claim.content
+        async for progress_json in (
+            run_verification_pipeline_sse(
+                claim.content
+            )
         ):
 
             # -------------------------------------------------
@@ -232,18 +342,20 @@ async def verify_claim_stream(
             # -------------------------------------------------
 
             if await request.is_disconnected():
+
                 print(
                     "Client disconnected during verification."
                 )
-                break
 
+                break
 
             # -------------------------------------------------
             # PARSE PIPELINE EVENT
             # -------------------------------------------------
 
-            data = json.loads(progress_json)
-
+            data = json.loads(
+                progress_json
+            )
 
             # =================================================
             # VERIFICATION COMPLETE
@@ -255,17 +367,23 @@ async def verify_claim_stream(
                 # CHECK FOR DEGRADED VERIFICATION
                 # -------------------------------------------------
 
-                verification_status = data.get(
-                    "verification_status"
+                verification_status = (
+                    data.get(
+                        "verification_status"
+                    )
                 )
 
-                ai_available = data.get(
-                    "ai_available",
-                    True
+                ai_available = (
+                    data.get(
+                        "ai_available",
+                        True
+                    )
                 )
 
-                degradation_reason = data.get(
-                    "degradation_reason"
+                degradation_reason = (
+                    data.get(
+                        "degradation_reason"
+                    )
                 )
 
                 is_degraded = (
@@ -274,7 +392,6 @@ async def verify_claim_stream(
                     or degradation_reason is not None
                 )
 
-
                 # =================================================
                 # DEGRADED RESULT
                 # =================================================
@@ -282,7 +399,8 @@ async def verify_claim_stream(
                 if is_degraded:
 
                     print(
-                        "Verification completed in DEGRADED mode."
+                        "Verification completed in "
+                        "DEGRADED mode."
                     )
 
                     print(
@@ -292,6 +410,7 @@ async def verify_claim_stream(
 
                     # -------------------------------------------------
                     # IMPORTANT:
+                    #
                     # Return the result to the frontend,
                     # but DO NOT save it to PostgreSQL.
                     # -------------------------------------------------
@@ -302,40 +421,147 @@ async def verify_claim_stream(
 
                     continue
 
-
                 # =================================================
                 # NORMAL RESULT
                 # =================================================
 
                 print(
                     "Verification completed normally. "
-                    "Saving result to database."
+                    "Saving result and evidence to database."
                 )
+
+                # =================================================
+                # CREATE CLAIM
+                # =================================================
 
                 new_claim = models.Claim(
                     content=claim.content,
                     embedding=embedding_list,
-                    verdict=data.get("verdict"),
-                    explanation=data.get("explanation"),
+                    verdict=data.get(
+                        "verdict"
+                    ),
+                    explanation=data.get(
+                        "explanation"
+                    ),
                 )
 
                 db.add(new_claim)
+
+                # Flush so new_claim.id becomes available
+                # before creating Evidence records.
+                db.flush()
+
+                # =================================================
+                # SAVE SUPPORTING EVIDENCE
+                # =================================================
+
+                evidence_items = data.get(
+                    "evidence",
+                    []
+                )
+
+                urls = data.get(
+                    "urls",
+                    []
+                )
+
+                for index, evidence in enumerate(
+                    evidence_items
+                ):
+
+                    # -------------------------------------------------
+                    # Evidence is normally a string.
+                    #
+                    # This also safely handles dictionary-style
+                    # evidence if the pipeline is changed later.
+                    # -------------------------------------------------
+
+                    if isinstance(
+                        evidence,
+                        str
+                    ):
+
+                        chunk_text = evidence
+
+                    elif isinstance(
+                        evidence,
+                        dict
+                    ):
+
+                        chunk_text = (
+                            evidence.get(
+                                "text"
+                            )
+                            or evidence.get(
+                                "chunk_text"
+                            )
+                            or str(evidence)
+                        )
+
+                    else:
+
+                        chunk_text = str(
+                            evidence
+                        )
+
+                    # -------------------------------------------------
+                    # Associate search evidence with its URL.
+                    #
+                    # Deep semantic chunks may not have a direct
+                    # URL association, so source_url remains None.
+                    # -------------------------------------------------
+
+                    source_url = None
+
+                    if index < len(urls):
+
+                        source_url = urls[index]
+
+                    # -------------------------------------------------
+                    # Create Evidence database record
+                    # -------------------------------------------------
+
+                    new_evidence = models.Evidence(
+                        claim_id=new_claim.id,
+                        source_url=source_url,
+                        chunk_text=chunk_text,
+                        similarity_score=None,
+                    )
+
+                    db.add(
+                        new_evidence
+                    )
+
+                # =================================================
+                # COMMIT CLAIM + EVIDENCE
+                # =================================================
+
                 db.commit()
-                db.refresh(new_claim)
 
+                db.refresh(
+                    new_claim
+                )
 
-                # -------------------------------------------------
+                # =================================================
                 # ATTACH DATABASE ID
-                # -------------------------------------------------
+                # =================================================
 
-                data["claim_id"] = new_claim.id
+                data["claim_id"] = (
+                    new_claim.id
+                )
 
-                # IMPORTANT:
-                # No GEM is awarded at verification time.
+                # This is a fresh/live verification.
+                data["cached"] = False
+
+                # =================================================
+                # NO GEM IS AWARDED AT VERIFICATION TIME
+                # =================================================
+
                 yield {
-                    "data": json.dumps(data)
+                    "data": json.dumps(
+                        data
+                    )
                 }
-
 
             # =================================================
             # PROCESSING / INTERMEDIATE EVENT
@@ -347,10 +573,9 @@ async def verify_claim_stream(
                     "data": progress_json
                 }
 
-
-    # ---------------------------------------------------------
+    # =========================================================
     # RETURN SSE RESPONSE
-    # ---------------------------------------------------------
+    # =========================================================
 
     return EventSourceResponse(
         event_generator()
